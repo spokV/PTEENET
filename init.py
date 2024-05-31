@@ -1,0 +1,337 @@
+"""
+initializer methods are defined in this code.
+"""
+import os
+import csv
+import argparse
+import inspect
+import six
+import torch
+import shutil
+#pylint: disable=W0611
+from torch import nn
+from torch.optim import Adam
+from torch.optim import SGD
+from custom_eenet import CustomEENet
+from custom_eenet import eenet8
+from eenet import EENet
+from egg import EGG
+from denseeenet import DenseEENet
+from eenet import eenet18, eenet34, eenet50, eenet101, eenet152
+from eenet import eenet20, eenet32, eenet44, eenet56, eenet110
+from egg import egg11, egg11_bn, egg13, egg13_bn, egg16, egg16_bn, egg19_bn, egg19
+from denseeenet import denseeenet121, denseeenet169, denseeenet201, denseeenet161
+from resnet import resnet18, resnet34, resnet50, resnet101, resnet152
+from resnet import resnet20, resnet32, resnet44, resnet56, resnet110
+from resnet import set_complexity
+from flops_counter import flops_to_string, params_to_string
+
+#import torch_xla
+#import torch_xla.core.xla_model as xm
+#pylint: enable=W0611
+
+def initializer(local_args):
+    """initializer of the program.
+
+    This parses and extracts all training and testing settings.
+    """
+    #pylint: disable=C0326, C0330
+    parser = argparse.ArgumentParser(description='PyTorch Early-Exit Convolutional Neural Nets')
+    parser.add_argument('--batch-size',   type=int,   default=32, metavar='N',
+                                          help='input batch size for training (default: 32)')
+    parser.add_argument('--test-batch',   type=int,   default=1, metavar='N',
+                                          help='input batch size for testing (default: 1)')
+    parser.add_argument('--epochs',       type=int,   default=150, metavar='N',
+                                          help='number of epochs to train (default: 150)')
+    parser.add_argument('--lr',           type=float, default=0.001, metavar='N',
+                                          help='learning rate (default: 0.001)')
+    parser.add_argument('--adaptive-lr',  action='store_true', default=False,
+                                          help='adjust the learning rate')
+    parser.add_argument('--momentum',     type=float, default=0.9, metavar='N',
+                                          help='SGD momentum (default: 0.9)')
+    parser.add_argument('--weight-decay', type=float, default=0.0001, metavar='N',
+                                          help='weight decay for optimizers (default: 0.0001)')
+    parser.add_argument('--no-cuda',      action='store_true', default=False,
+                                          help='disable CUDA training')
+    parser.add_argument('--clear-dirs',   action='store_true', default=False,
+                                          help='clear output dirs')
+    parser.add_argument('--no-tensorboard', action='store_true', default=False,
+                                          help='disable Tensorboard log')
+    parser.add_argument('--multi-gpu',    action='store_true', default=False,
+                                          help='enable multi-gpu training')
+    parser.add_argument('--seed',         type=int,   default=1, metavar='N',
+                                          help='random seed (default: 1)')
+    parser.add_argument('--log-interval', type=int,   default=1, metavar='N',
+                                          help='how many epochs to wait before logging training '+\
+                                           'status (default: 1)')
+    parser.add_argument('--no-save-model',action='store_true', default=False,
+                                          help='do not save the current model')
+    parser.add_argument('--load-model',   type=str,   default=None, metavar='S',
+                                          help='the path for loading and evaluating model')
+    parser.add_argument('--noise-snr',    type=int,   default=0, metavar='N',
+                                          help='added noise SNR (default: 0)')
+    parser.add_argument('--min-noise-snr',type=int,   default=0, metavar='N',
+                                          help='added noise SNR (default: 0)')
+    parser.add_argument('--max-noise-snr',type=int,   default=0, metavar='N',
+                                          help='added noise SNR (default: 0)')
+    parser.add_argument('--num-noise-levels',type=int,   default=0, metavar='N',
+                                          help='added noise SNR (default: 0)')
+    #parser.add_argument('--training-snr',  type=int,   default=0, metavar='N',
+    #                                      help='training SNR (default: 0)')
+    parser.add_argument('--add-noise',    action='store_true', default=False,
+                                          help='activate testing to loaded model')
+    parser.add_argument('--early-stopping', action='store_true', default=False,
+                                          help='activate early stopping')
+    parser.add_argument('--shuffle-train',action='store_true', default=False,
+                                          help='shuffle train set')
+    parser.add_argument('--shuffle-test' ,action='store_true', default=False,
+                                          help='shuffle train set')
+    #parser.add_argument('--examine', action='store_true', default=False,
+    #                                      help='get clean prediction in validate mode')
+    parser.add_argument('--loss-threshold', type=float, default=0, metavar='N',
+                                          help='ee loss threshold (default: 0.1)')
+    parser.add_argument('--loss-main',    type=float, default=0, metavar='N',
+                                          help='main vanila loss (default: 0.1)')
+    parser.add_argument('--two-stage',    action='store_true', default=False,
+                                          help='two stage learning for loss version 1')
+    parser.add_argument('--filters',      type=int,   default=2, metavar='N',
+                                          help='initial filters of custom eenet-8 (default: 2)')
+    parser.add_argument('--max-depth',    type=int,   default=6, metavar='N',
+                                          help='xgboost max depth (default: 6)')
+    parser.add_argument('--lambda-coef',  type=float, default=1.0, metavar='N',
+                                          help='lambda to arrange the balance between accuracy '+\
+                                           'and cost (default: 1.0)')
+    parser.add_argument('--num-ee',       type=int,   default=2, metavar='N',
+                                          help='the number of early exit blocks (default: 2)')
+    parser.add_argument('--dataset',      type=str,   default='cifar10',
+                                          choices=['mnist','cifar10','cifar100','svhn','imagenet','imagenet32','tiny-imagenet'],
+                                          help='dataset to be evaluated (default: cifar10)')
+    parser.add_argument('--loss-func',    type=str,   default='v2', choices=['v0','v1','v2','v3', 'v4', 'v5', 'v6', 'v7'],
+                                          help='loss function (default: v2)')
+    parser.add_argument('--optimizer',    type=str,   default='Adam', choices=['SGD','Adam'],
+                                          help='optimizer (default: Adam)')
+    parser.add_argument('--distribution', type=str,   default='fine',
+                                          choices=['gold_ratio', 'pareto', 'fine', 'linear'],
+                                          help='distribution method of exit blocks (default: fine)')
+    parser.add_argument('--termination',  type=str,   default='entropy',
+                                          choices=['entropy', 'confidence'],
+                                          help='termination method of exit blocks (default: entropy)')
+    parser.add_argument('--exit-type',    type=str,   default='pool', choices=['plain', 'pool',
+                                           'bnpool', 'conv', 'conv2', 'conv3'],
+                                          help='Exit block type.')
+    parser.add_argument('--model',        type=str,   default='eenet20',
+                                          choices=['eenet8',
+                                           'eenet18', 'eenet34', 'eenet50', 'eenet101', 'eenet152',
+                                           'eenet20', 'eenet32', 'eenet44', 'eenet56',  'eenet110',
+                                           'resnet18','resnet34','resnet50','resnet101','resnet152',
+                                           'resnet20','resnet32','resnet44','resnet56', 'resnet110',
+                                           'egg11', 'egg11_bn', 'egg13', 'egg13_bn', 'egg16', 'egg16_bn',
+                                           'egg19_bn', 'egg19',
+                                           'denseeenet121', 'denseeenet169', 'denseeenet201', 
+                                           'denseeenet161',
+                                          ],
+                                          help='model to be evaluated (default: eenet20)')
+    parser.add_argument('--device',       help=argparse.SUPPRESS)
+    
+    parser.add_argument('--start-epoch',  type=int, default=0, metavar='N',
+                                          help='manual epoch number (useful on restarts)')
+    parser.add_argument('--recorder',     help=argparse.SUPPRESS)
+    parser.add_argument('--results-dir',  help=argparse.SUPPRESS)
+    parser.add_argument('--models-dir',   help=argparse.SUPPRESS)
+    parser.add_argument('--gated-models-dir',   help=argparse.SUPPRESS)
+    parser.add_argument('--ground-truths-dir',   help=argparse.SUPPRESS)
+    parser.add_argument('--relative-losses-dir',   help=argparse.SUPPRESS)
+    parser.add_argument('--noise-str',   help=argparse.SUPPRESS)
+    parser.add_argument('--hist-file',    help=argparse.SUPPRESS)
+    parser.add_argument('--num-classes',  help=argparse.SUPPRESS, default=10)
+    parser.add_argument('--input-shape',  help=argparse.SUPPRESS, default=(3, 32, 32))
+    parser.add_argument('--plot-history', action='store_true', default=False,
+                        help='plot history on matplotlib')
+    parser.add_argument('--validate', action='store_true', default=False,
+                        help='use validation batch as test')
+    #parser.add_argument('--ee-disable', action='store_true', default=False,
+    #                    help='disable branches training')
+    parser.add_argument('--use-main-targets', action='store_true', default=False,
+                        help='use main targets for train branches')
+    parser.add_argument('--save-best', action='store_true', default=False,
+                        help='close history with best model')
+    parser.add_argument('--ee-costs', nargs='+', type=float,
+                    help='custom costs', default=None)                  
+    
+    args = parser.parse_args(local_args)
+    
+    if args.dataset == 'mnist':
+        args.input_shape = (1, 28, 28)
+
+    elif args.dataset == 'imagenet':
+        args.num_classes = 1000
+        args.input_shape = (3, 224, 224)
+
+    elif args.dataset == 'imagenet32':
+        args.num_classes = 1000
+        args.input_shape = (3, 32, 32)
+
+    elif args.dataset == 'tiny-imagenet':
+        args.num_classes = 200
+        args.input_shape = (3, 64, 64)
+
+    elif args.dataset == 'cifar100':
+        args.num_classes = 100
+        args.input_shape = (3, 32, 32)
+    
+    if args.model == 'eenet8':
+        args.num_ee = 2
+
+    if args.model[:6] == "resnet":
+        args.num_ee = 0
+
+    torch.manual_seed(args.seed)
+    #if os.environ['COLAB_TPU_ADDR']:
+    #    # imports the torch_xla package
+    #    import torch_xla
+    #    import torch_xla.core.xla_model as xm
+    #    args.device = xm.xla_device()
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    args.device = torch.device('cuda' if use_cuda else 'cpu')
+    #args.device = xm.xla_device()
+    print('use cuda: ', use_cuda, ' device: ', args.device)
+    if use_cuda:
+        torch.cuda.empty_cache()
+    
+
+    # model configurations
+    kwargs = vars(args)
+    if args.load_model is None:
+        model_object = _get_object(args.model)
+        model = model_object(**kwargs)
+
+        # create model folder
+        args.models_dir = 'runs/models/'+args.dataset+'/'+args.model
+        if args.num_ee > 0:
+            args.models_dir += '/ee'+str(args.num_ee) + '_' + args.distribution + '_' + args.exit_type + '_lambda_' + str(args.lambda_coef)
+        if args.clear_dirs:
+            if os.path.exists(args.models_dir):
+                shutil.rmtree(args.models_dir)
+        if not os.path.exists(args.models_dir):
+            os.makedirs(args.models_dir)
+            
+        # continue to broken training
+        args.start_epoch = 1
+        while os.path.exists(args.models_dir+'/model'+'.v'+str(args.start_epoch)+'.pt'):
+            args.start_epoch += 1
+        if args.start_epoch > 1:
+            model = torch.load(args.models_dir+'/model'+'.v'+str(args.start_epoch-1)+'.pt')
+            print('last model found and loaded: ', args.models_dir+'/model'+'.v'+str(args.start_epoch-1)+'.pt')
+            if not isinstance(model, (CustomEENet, EENet, EGG, DenseEENet)):
+                set_complexity(model)
+    else:
+        #models/cifar10/eenet110/UT/after_main_training/model_m2db.pt
+        #args.load_model = 'models/' + args.dataset + '/' + args.model + '/UT/' + args.load_model + '/model_'  + str(args.noise_snr) + 'db.pt'
+        #print(model_s)
+        model = torch.load(args.load_model, map_location=args.device)
+        args.start_epoch = 1
+        print('empty model loaded at: ', args.load_model)
+        if not isinstance(model, (CustomEENet, EENet, EGG, DenseEENet)):
+            set_complexity(model)
+        else:
+            args.num_ee = model.num_ee
+            model_name = model.__class__.__name__
+            print(model_name)
+            #args.model = "eenet"+str(model.total_layers)
+            args.exit_type = model.exit_type
+            args.distribution = model.distribution
+            if args.ee_costs is not None:
+                model.cost = args.ee_costs
+            # create model folder
+            args.models_dir = 'runs/models/'+args.dataset+'/'+args.model
+            if args.num_ee > 0:
+                args.models_dir += '/ee'+str(args.num_ee) + '_' + args.distribution + '_' + args.exit_type + '_lambda_' + str(args.lambda_coef)
+            if args.clear_dirs:
+                if os.path.exists(args.models_dir):
+                    shutil.rmtree(args.models_dir)
+            if not os.path.exists(args.models_dir):
+                os.makedirs(args.models_dir)
+        
+
+    # use multiple GPU
+    if use_cuda and torch.cuda.device_count() > 1 and args.multi_gpu:
+        model.set_multiple_gpus()
+        #model = nn.DataParallel(model)
+
+    #print(model.layers)
+    model = model.to(args.device)
+
+    # optimizer configurations
+    optimizer_object = _get_object(args.optimizer)
+    keys = kwargs.keys() & inspect.getfullargspec(optimizer_object).args
+    optimizer_args = {k:kwargs[k] for k in keys}
+    optimizer = optimizer_object(model.parameters(), **optimizer_args)
+
+    #lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+    #                    milestones=[100, 150], last_epoch=args.start_epoch - 1)
+    lr_scheduler = None
+
+    # print cost of exit blocks
+    total_flops, _ = model.complexity[-1]
+    for i, (flops, params) in enumerate(model.complexity[:-1]):
+        print('ee-block-{}: flops={}, params={}, cost-rate={:.2f}'
+              .format(i, flops_to_string(flops), params_to_string(params), flops/total_flops))
+    flops, params = model.complexity[-1]
+    print('exit-block: flops={}, params={}, cost-rate={:.2f}'
+          .format(flops_to_string(flops), params_to_string(params), flops/total_flops))
+
+    # create result folder
+    args.results_dir = 'runs/results/'+args.dataset+'/'+args.model
+    if args.num_ee > 0:
+        args.results_dir += '/ee' + str(args.num_ee) + '_' + args.distribution + '_' + args.exit_type + '_lambda_' + str(args.lambda_coef)
+    if args.clear_dirs:
+        if os.path.exists(args.results_dir):
+            shutil.rmtree(args.results_dir)
+    if not os.path.exists(args.results_dir):
+        os.makedirs(args.results_dir)
+
+    if args.add_noise == False:
+        args.noise_str = 'no_noise'
+    else:
+        args.noise_str = 'snr_' + str(args.noise_snr)
+    
+    args.ground_truths_dir = 'gated_ground_truths/' + args.dataset# + '/levels_' + str(args.num_noise_levels)
+    if not os.path.exists(args.ground_truths_dir):
+        os.makedirs(args.ground_truths_dir)
+    args.gated_models_dir = 'gated_models/' + args.dataset + '/' + args.noise_str
+    if not os.path.exists(args.gated_models_dir):
+        os.makedirs(args.gated_models_dir)
+    args.relative_losses_dir = 'relative_losses/' + args.dataset + '/' + args.noise_str
+    if not os.path.exists(args.relative_losses_dir):
+        os.makedirs(args.relative_losses_dir)
+
+    args.hist_file = open(args.results_dir+'/history.csv', 'a', newline='')
+    args.recorder = csv.writer(args.hist_file, delimiter=',')
+    if os.stat(args.results_dir+'/history.csv').st_size == 0:
+        keys = ['epoch',
+                'acc', 'acc_sem',
+                'cost', 'cost_sem',
+                'flop', 'flop_sem',
+                'time', 'time_sem',
+                'train_loss', 'train_loss_sem',
+                'pred_loss', 'pred_loss_sem',
+                'cost_loss', 'cost_loss_sem',
+                'val_loss', 'val_loss_sem', 
+                'exit_points', 
+                'exit_points_std', 'exit_points_std_sem']
+        args.recorder.writerow(sorted(keys))
+
+    return model, optimizer, lr_scheduler, args
+
+
+def _get_object(identifier):
+    """Cbject getter.
+
+    This creates instances of the command line arguments by getting related objects.
+    """
+    if isinstance(identifier, six.string_types):
+        res = globals().get(identifier)
+        if not res:
+            raise ValueError('Invalid {}'.format(identifier))
+        return res
+    return identifier
